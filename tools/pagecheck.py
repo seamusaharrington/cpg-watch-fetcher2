@@ -55,18 +55,30 @@ BLOCK = {"p", "div", "section", "article", "main", "h1", "h2", "h3", "h4", "h5",
 VOID = {"br", "img", "hr", "input", "meta", "link", "area", "base", "col", "embed", "source", "track", "wbr"}
 STAMP = re.compile(r"\b(last\s+(?:updated|update|revised|reviewed)|updated)\b\s*:?\s*((?:\d{1,2}\s+)?[A-Za-z]{3,9}\.?,?\s+(?:19|20)\d\d)", re.I)
 
+LENIENT_SKIP = {"script", "style", "noscript", "svg", "template", "iframe", "title"}
+
 class Extract(HTMLParser):
-    def __init__(self):
+    """strict: drops nav/header/footer/forms and menu-like blocks.
+    lenient: drops only script/style-type content and relies on the h1 -> stamp slice below
+    (used when strict mode loses the guideline body, e.g. a page-wide <form> or unbalanced tags)."""
+    def __init__(self, lenient=False):
         super().__init__(convert_charrefs=True)
+        self.lenient = lenient
         self.out, self.skip, self.skipname, self.cell, self.images, self.h1, self.in_h1 = [], 0, None, False, [], "", False
+        self.doctitle, self.in_title = "", False
     def nl(self): self.out.append("\n")
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
+        if tag == "title": self.in_title = True
         if self.skip:
             if tag == self.skipname and tag not in VOID: self.skip += 1
             return
         idc = " ".join(filter(None, [a.get("id", ""), a.get("class", ""), a.get("role", "")]))
-        if tag in SKIP_TAGS or (tag in ("div", "section", "ul", "aside") and SKIP_ATTR.search(idc)):
+        if self.lenient:
+            drop = tag in LENIENT_SKIP
+        else:
+            drop = tag in SKIP_TAGS or tag == "title" or (tag in ("div", "section", "ul", "aside") and SKIP_ATTR.search(idc))
+        if drop:
             if tag not in VOID: self.skip, self.skipname = 1, tag
             return
         if tag == "img":
@@ -81,6 +93,7 @@ class Extract(HTMLParser):
         if tag == "li": self.out.append("- ")
         if tag == "h1": self.in_h1 = True
     def handle_endtag(self, tag):
+        if tag == "title": self.in_title = False
         if self.skip:
             if tag == self.skipname:
                 self.skip -= 1
@@ -89,26 +102,40 @@ class Extract(HTMLParser):
         if tag == "h1": self.in_h1 = False
         if tag in BLOCK or tag == "tr": self.nl()
     def handle_data(self, d):
+        if self.in_title: self.doctitle += d
         if self.skip: return
         self.out.append(d)
         if self.in_h1: self.h1 += d
 
-def html_to_text(raw):
-    p = Extract(); p.feed(raw); p.close()
+def _extract(raw, lenient):
+    p = Extract(lenient); p.feed(raw); p.close()
     lines = []
     for ln in "".join(p.out).replace("\xa0", " ").split("\n"):
         ln = re.sub(r"[ \t\r\f\v]+", " ", ln).strip(" |")
         ln = re.sub(r"\s+\|\s+", " | ", ln).strip()
         if ln and not re.fullmatch(r"-?", ln): lines.append(ln)
     title = re.sub(r"\s+", " ", p.h1).strip()
+    if not title:  # fall back to the <title> element, e.g. "Clinical Practice Guidelines : Anaphylaxis"
+        dt = re.sub(r"\s+", " ", p.doctitle).strip()
+        title = dt.split(" : ", 1)[1].strip() if " : " in dt else dt
     start = next((i for i, l in enumerate(lines) if title and l == title), 0)
     stamp_i = [i for i, l in enumerate(lines) if STAMP.search(l)]
     end = stamp_i[-1] + 1 if stamp_i and stamp_i[-1] >= start else len(lines)
     body = lines[start:end]
-    m = STAMP.search(lines[stamp_i[-1]]) if stamp_i else None
+    m = STAMP.search(lines[stamp_i[-1]]) if stamp_i and stamp_i[-1] >= start else None
     stamp = re.sub(r"\s+", " ", m.group(0)).strip() if m else ""
-    return "\n".join(body) + "\n", {"title": title, "stamp": stamp, "images": p.images,
-                                     "imageCount": len(p.images), "lines": len(body)}
+    text = "\n".join(body) + "\n"
+    return text, {"title": title, "stamp": stamp, "images": p.images, "imageCount": len(p.images),
+                  "lines": len(body), "mode": "lenient" if lenient else "strict", "h1": bool(p.h1.strip())}
+
+def html_to_text(raw):
+    """Strict extraction first; if it loses the page (no <h1> or under 300 characters), use lenient
+    extraction instead. The choice depends only on the HTML, so hashes stay comparable week to week."""
+    text, meta = _extract(raw, False)
+    if not meta["h1"] or len(text) < 300:
+        t2, m2 = _extract(raw, True)
+        if len(t2) > len(text): text, meta = t2, m2
+    return text, meta
 
 def cmd_text(outdir):
     res = {}
