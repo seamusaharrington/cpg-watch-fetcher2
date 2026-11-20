@@ -7,11 +7,11 @@ full text of every RCH Clinical Practice Guideline page for the weekly CPG Watch
 Writes <outdir>/bundle.json:
   {generatedAt, source, index:{text, sha256, links:[{text,href}], newUpdatedBox},
    pages:{<url>:{status, finalUrl, error, title, stamp, sha256, chars, imageCount, images, text}},
-   counts:{...}}
+   counts:{...}, rawSamples:{<url>: <raw html>}}
 The text is produced by tools/pagecheck.py's html_to_text, the same extraction the tracker
 uses, so hashes are comparable from run to run. Standard library only.
 """
-import json, os, re, sys, time, hashlib, urllib.request, urllib.error
+import json, os, re, sys, time, hashlib, urllib.request, urllib.error, urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -22,9 +22,11 @@ html_to_text, Links = _ns["html_to_text"], _ns["Links"]
 
 INDEX = "https://www.rch.org.au/clinicalguide/"
 UA = "Mozilla/5.0 (CPG Watch weekly check; GitHub Actions)"
+# raw HTML of the index and two guideline pages is kept in the bundle so extraction can be debugged
+SAMPLE_KEYS = ("/Anaphylaxis/", "/Gastroenteritis/", "/Sepsis")
 SKIP_TITLES = {"cpg committee calendar", "cpg information", "other resources", "paediatric improvement collaborative",
                "parent resources", "retrieval services", "adverse drug reaction (adr) reporting",
-               "okee in medical imaging app", "x - complete an online death certificate"}
+               "okee in medical imaging app", "x - complete an online death certificate", "nursing guidelines"}
 
 def norm(u): return u.strip().lower().rstrip("/")
 
@@ -32,7 +34,8 @@ def get(url, tries=3):
     last = {}
     for i in range(tries):
         try:
-            req = urllib.request.Request(url.replace(" ", "%20"), headers={"User-Agent": UA})
+            safe_url = urllib.parse.quote(url.strip().replace(" ", "%20"), safe=":/?&=#%+~@!$,;()*'")
+            req = urllib.request.Request(safe_url, headers={"User-Agent": UA})
             with urllib.request.urlopen(req, timeout=45) as r:
                 raw = r.read().decode(r.headers.get_content_charset() or "utf-8", "replace")
                 return {"status": r.status, "finalUrl": r.geturl(), "error": "", "html": raw}
@@ -74,23 +77,32 @@ def main(outdir):
     m = re.search(r"New and updated clinical practice guidelines(.{0,1500})", itext, re.S | re.I)
     box = m.group(1).strip() if m else ""
 
-    def one(u):
+    raw_samples = {INDEX: idx["html"]}
+    def one_keep(u):
         r = get(u); time.sleep(0.5)
+        return u, r
+    with ThreadPoolExecutor(4) as ex:
+        fetched = dict(ex.map(one_keep, targets))
+    pages = {}
+    for u, r in fetched.items():
         rec = {k: r.get(k, "") for k in ("status", "finalUrl", "error")}
         if r.get("html"):
             text, meta = html_to_text(r["html"])
             rec.update({"title": meta["title"], "stamp": meta["stamp"], "imageCount": meta["imageCount"],
-                        "images": meta["images"], "chars": len(text),
+                        "images": meta["images"], "chars": len(text), "mode": meta["mode"],
                         "sha256": hashlib.sha256(text.encode()).hexdigest(), "text": text})
-        return u, rec
-    with ThreadPoolExecutor(4) as ex:
-        pages = dict(ex.map(one, targets))
+            if any(k in u for k in SAMPLE_KEYS) and len(raw_samples) < 4: raw_samples[u] = r["html"]
+        pages[u] = rec
     ok = sum(1 for v in pages.values() if v["status"] == 200 and v.get("chars", 0) > 0)
+    short = sum(1 for v in pages.values() if v["status"] == 200 and v.get("chars", 0) < 300)
+    lenient = sum(1 for v in pages.values() if v.get("mode") == "lenient")
     bundle = {"generatedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"), "source": INDEX,
               "index": {"text": itext, "sha256": hashlib.sha256(itext.encode()).hexdigest(), "links": links,
                         "newUpdatedBox": box},
               "pages": pages,
-              "counts": {"indexLinks": len(links), "distinctUrls": len(seen), "fetched": len(targets), "ok": ok}}
+              "counts": {"indexLinks": len(links), "distinctUrls": len(seen), "fetched": len(targets), "ok": ok,
+                         "short": short, "lenient": lenient},
+              "rawSamples": raw_samples}
     json.dump(bundle, open(os.path.join(outdir, "bundle.json"), "w"), ensure_ascii=False, indent=0)
     print(json.dumps(bundle["counts"]))
     for u, v in pages.items():
