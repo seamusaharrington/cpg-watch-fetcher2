@@ -153,8 +153,9 @@ def html_to_text(raw):
     The choice depends only on the HTML, so hashes stay comparable week to week."""
     for rid in CONTENT_ROOTS:
         if re.search(r'id\s*=\s*["\']%s["\']' % re.escape(rid), raw):
-            text, meta = _extract(raw, True, rid)
-            if meta["h1"] and len(text) >= 200: return text, meta
+            # Always trust the content block when it exists: a stub page (title only, no guideline
+            # body) then comes out short and is reported as a stub, instead of picking up site chrome.
+            return _extract(raw, True, rid)
     text, meta = _extract(raw, False)
     if not meta["h1"] or len(text) < 300:
         t2, m2 = _extract(raw, True)
