@@ -55,27 +55,38 @@ BLOCK = {"p", "div", "section", "article", "main", "h1", "h2", "h3", "h4", "h5",
 VOID = {"br", "img", "hr", "input", "meta", "link", "area", "base", "col", "embed", "source", "track", "wbr"}
 STAMP = re.compile(r"\b(last\s+(?:updated|update|revised|reviewed)|updated)\b\s*:?\s*((?:\d{1,2}\s+)?[A-Za-z]{3,9}\.?,?\s+(?:19|20)\d\d)", re.I)
 
+VISIBLE_PRINT = re.compile(r"(^|\s)visible-print(\s|$)", re.I)
+CONTENT_ROOTS = ("rch-primary",)   # RCH pages: the guideline body sits in <div id="rch-primary">
 LENIENT_SKIP = {"script", "style", "noscript", "svg", "template", "iframe", "title"}
 
 class Extract(HTMLParser):
     """strict: drops nav/header/footer/forms and menu-like blocks.
     lenient: drops only script/style-type content and relies on the h1 -> stamp slice below
     (used when strict mode loses the guideline body, e.g. a page-wide <form> or unbalanced tags)."""
-    def __init__(self, lenient=False):
+    def __init__(self, lenient=False, root_id=None):
         super().__init__(convert_charrefs=True)
-        self.lenient = lenient
+        self.lenient, self.root_id = lenient, root_id
+        self.root_tag, self.root_depth, self.root_seen = None, 0, False
         self.out, self.skip, self.skipname, self.cell, self.images, self.h1, self.in_h1 = [], 0, None, False, [], "", False
         self.doctitle, self.in_title = "", False
     def nl(self): self.out.append("\n")
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
         if tag == "title": self.in_title = True
+        if self.root_id:
+            if self.root_depth:
+                if tag == self.root_tag and tag not in VOID: self.root_depth += 1
+            elif a.get("id") == self.root_id and not self.root_seen:
+                self.root_tag, self.root_depth, self.root_seen = tag, 1, True
+                return
+            else:
+                return
         if self.skip:
             if tag == self.skipname and tag not in VOID: self.skip += 1
             return
         idc = " ".join(filter(None, [a.get("id", ""), a.get("class", ""), a.get("role", "")]))
         if self.lenient:
-            drop = tag in LENIENT_SKIP
+            drop = tag in LENIENT_SKIP or (tag in ("div", "section") and VISIBLE_PRINT.search(a.get("class", "")))
         else:
             drop = tag in SKIP_TAGS or tag == "title" or (tag in ("div", "section", "ul", "aside") and SKIP_ATTR.search(idc))
         if drop:
@@ -94,6 +105,11 @@ class Extract(HTMLParser):
         if tag == "h1": self.in_h1 = True
     def handle_endtag(self, tag):
         if tag == "title": self.in_title = False
+        if self.root_id:
+            if not self.root_depth: return
+            if tag == self.root_tag:
+                self.root_depth -= 1
+                if not self.root_depth: self.nl(); return
         if self.skip:
             if tag == self.skipname:
                 self.skip -= 1
@@ -103,12 +119,13 @@ class Extract(HTMLParser):
         if tag in BLOCK or tag == "tr": self.nl()
     def handle_data(self, d):
         if self.in_title: self.doctitle += d
+        if self.root_id and not self.root_depth: return
         if self.skip: return
         self.out.append(d)
         if self.in_h1: self.h1 += d
 
-def _extract(raw, lenient):
-    p = Extract(lenient); p.feed(raw); p.close()
+def _extract(raw, lenient, root_id=None):
+    p = Extract(lenient, root_id); p.feed(raw); p.close()
     lines = []
     for ln in "".join(p.out).replace("\xa0", " ").split("\n"):
         ln = re.sub(r"[ \t\r\f\v]+", " ", ln).strip(" |")
@@ -126,11 +143,18 @@ def _extract(raw, lenient):
     stamp = re.sub(r"\s+", " ", m.group(0)).strip() if m else ""
     text = "\n".join(body) + "\n"
     return text, {"title": title, "stamp": stamp, "images": p.images, "imageCount": len(p.images),
-                  "lines": len(body), "mode": "lenient" if lenient else "strict", "h1": bool(p.h1.strip())}
+                  "lines": len(body), "mode": ("root:" + root_id) if root_id else ("lenient" if lenient else "strict"),
+                  "h1": bool(p.h1.strip())}
 
 def html_to_text(raw):
-    """Strict extraction first; if it loses the page (no <h1> or under 300 characters), use lenient
-    extraction instead. The choice depends only on the HTML, so hashes stay comparable week to week."""
+    """RCH pages: read only the content block (<div id="rch-primary">), dropping script/style and the
+    print-only header, then cut from the <h1> to the "Last updated" line.
+    Other pages: strict extraction; if it loses the page (no <h1> or under 300 characters), lenient.
+    The choice depends only on the HTML, so hashes stay comparable week to week."""
+    for rid in CONTENT_ROOTS:
+        if re.search(r'id\s*=\s*["\']%s["\']' % re.escape(rid), raw):
+            text, meta = _extract(raw, True, rid)
+            if meta["h1"] and len(text) >= 200: return text, meta
     text, meta = _extract(raw, False)
     if not meta["h1"] or len(text) < 300:
         t2, m2 = _extract(raw, True)
